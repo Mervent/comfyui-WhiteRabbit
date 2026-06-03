@@ -578,7 +578,6 @@ class BatchResizeWithLanczos:
         mode = _normalize_mode(resize_mode)
 
         device = torch.device("cuda")
-        image = image.float().clamp_(0, 1)
 
         if mode == "stretch":
             tw, th = _divisible_box(width, height, d)
@@ -615,17 +614,42 @@ class BatchResizeWithLanczos:
         else:
             raise ValueError(f"Unknown resize_mode: {resize_mode}")
 
-        out_imgs: List[torch.Tensor] = []
-        out_masks: List[torch.Tensor] = []
-
         crop_like = mode in ("crop", "ar_scale_crop_divisible")
         pad_like = mode == "pad"
         resize_to = (rh, rw) if (crop_like or pad_like) else (out_h, out_w)
 
+        # Pre-compute crop/pad geometry (constant across all chunks)
+        ox = oy = 0
+        left = right = top = bottom = 0
+
+        if crop_like:
+            ox, oy = _crop_offsets(crop_position, rw, rh, out_w, out_h)
+        elif pad_like:
+            pad_w = max(0, out_w - rw)
+            pad_h = max(0, out_h - rh)
+            left, right, top, bottom = _pad_sides(crop_position, pad_w, pad_h)
+
+            if d > 1:
+                base_w = rw + left + right
+                base_h = rh + top + bottom
+                right += _ceil_mul(base_w, d) - base_w
+                bottom += _ceil_mul(base_h, d) - base_h
+                out_w = rw + left + right
+                out_h = rh + top + bottom
+
+        # Pre-allocate output tensors (avoids list accumulation + torch.cat copy)
+        images_out = torch.empty(B, out_h, out_w, C, dtype=torch.float32)
+        has_mask = isinstance(mask, torch.Tensor)
+        mask_out = (
+            torch.empty(B, out_h, out_w, dtype=torch.float32)
+            if has_mask
+            else torch.zeros((B, out_h, out_w), dtype=torch.float32)
+        )
+
         pbar = comfy_utils.ProgressBar(B)
 
         for s, e in _chunk_spans(B, int(max_batch_size)):
-            x = image[s:e].movedim(-1, 1).to(device, non_blocking=True)
+            x = image[s:e].float().clamp_(0, 1).movedim(-1, 1).to(device, non_blocking=True)
 
             y = lanczos_resize(
                 x,
@@ -637,25 +661,9 @@ class BatchResizeWithLanczos:
                 chunk_size=0,
             )
 
-            ox = oy = 0
-            left = right = top = bottom = 0
-
             if crop_like:
-                ox, oy = _crop_offsets(crop_position, rw, rh, out_w, out_h)
                 y = y[:, :, oy : oy + out_h, ox : ox + out_w]
             elif pad_like:
-                pad_w = max(0, out_w - rw)
-                pad_h = max(0, out_h - rh)
-                left, right, top, bottom = _pad_sides(crop_position, pad_w, pad_h)
-
-                if d > 1:
-                    base_w = rw + left + right
-                    base_h = rh + top + bottom
-                    right += _ceil_mul(base_w, d) - base_w
-                    bottom += _ceil_mul(base_h, d) - base_h
-                    out_w = rw + left + right
-                    out_h = rh + top + bottom
-
                 color = _parse_pad_color(pad_color, C, y.device, y.dtype).view(
                     1, C, 1, 1
                 )
@@ -663,9 +671,9 @@ class BatchResizeWithLanczos:
                 canvas[:, :, top : top + rh, left : left + rw] = y
                 y = canvas
 
-            out_imgs.append(y.to("cpu", non_blocking=False).movedim(1, -1))
+            images_out[s:e] = y.to("cpu", non_blocking=True).movedim(1, -1)
 
-            if isinstance(mask, torch.Tensor):
+            if has_mask:
                 m = mask[s:e].unsqueeze(1).to(device, non_blocking=True)
                 m_res = _nearest_interp(m, size=resize_to)
                 if crop_like:
@@ -678,16 +686,11 @@ class BatchResizeWithLanczos:
                     )
                     base[:, :, top : top + rh, left : left + rw] = m_res
                     m_res = base
-                out_masks.append(m_res.squeeze(1).to("cpu", non_blocking=False))
+                mask_out[s:e] = m_res.squeeze(1).to("cpu", non_blocking=True)
 
             pbar.update(e - s)
 
-        images_out = torch.cat(out_imgs, dim=0)
-        mask_out = (
-            torch.cat(out_masks, dim=0)
-            if out_masks
-            else torch.zeros((B, out_h, out_w), dtype=torch.float32)
-        )
+        torch.cuda.synchronize()
 
         return images_out, out_w, out_h, mask_out
 
