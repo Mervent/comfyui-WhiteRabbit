@@ -671,7 +671,7 @@ class BatchResizeWithLanczos:
                 canvas[:, :, top : top + rh, left : left + rw] = y
                 y = canvas
 
-            images_out[s:e] = y.to("cpu", non_blocking=True).movedim(1, -1)
+            images_out[s:e] = y.movedim(1, -1).to("cpu")
 
             if has_mask:
                 m = mask[s:e].unsqueeze(1).to(device, non_blocking=True)
@@ -686,11 +686,9 @@ class BatchResizeWithLanczos:
                     )
                     base[:, :, top : top + rh, left : left + rw] = m_res
                     m_res = base
-                mask_out[s:e] = m_res.squeeze(1).to("cpu", non_blocking=True)
+                mask_out[s:e] = m_res.squeeze(1).to("cpu")
 
             pbar.update(e - s)
-
-        torch.cuda.synchronize()
 
         return images_out, out_w, out_h, mask_out
 
